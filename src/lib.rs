@@ -232,7 +232,7 @@ pub struct DeviceInfo {
 
 /// Represents a connection to an ADB host, which multiplexes the connections to
 /// individual devices.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Host {
     /// The TCP host to connect to.  Defaults to `"localhost"`.
     pub host: Option<String>,
