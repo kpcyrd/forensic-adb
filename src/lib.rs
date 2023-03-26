@@ -13,15 +13,16 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
-use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io;
 use std::iter::FromIterator;
-use std::net::TcpStream;
 use std::num::{ParseIntError, TryFromIntError};
 use std::path::{Component, Path};
 use std::str::{FromStr, Utf8Error};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use thiserror::Error;
+use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 pub use unix_path::{Path as UnixPath, PathBuf as UnixPathBuf};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -124,9 +125,9 @@ fn parse_device_info(line: &str) -> Option<DeviceInfo> {
 }
 
 /// Reads the payload length of a host message from the stream.
-fn read_length<R: Read>(stream: &mut R) -> Result<usize> {
+async fn read_length<R: AsyncRead + Unpin>(stream: &mut R) -> Result<usize> {
     let mut bytes: [u8; 4] = [0; 4];
-    stream.read_exact(&mut bytes)?;
+    stream.read_exact(&mut bytes).await?;
 
     let response = std::str::from_utf8(&bytes)?;
 
@@ -134,9 +135,9 @@ fn read_length<R: Read>(stream: &mut R) -> Result<usize> {
 }
 
 /// Reads the payload length of a device message from the stream.
-fn read_length_little_endian(reader: &mut dyn Read) -> Result<usize> {
+async fn read_length_little_endian<R: AsyncRead + Unpin>(reader: &mut R) -> Result<usize> {
     let mut bytes: [u8; 4] = [0; 4];
-    reader.read_exact(&mut bytes)?;
+    reader.read_exact(&mut bytes).await?;
 
     let n: usize = (bytes[0] as usize)
         + ((bytes[1] as usize) << 8)
@@ -147,24 +148,31 @@ fn read_length_little_endian(reader: &mut dyn Read) -> Result<usize> {
 }
 
 /// Writes the payload length of a device message to the stream.
-fn write_length_little_endian(writer: &mut dyn Write, n: usize) -> Result<usize> {
+async fn write_length_little_endian<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    n: usize,
+) -> Result<usize> {
     let mut bytes = [0; 4];
     bytes[0] = (n & 0xFF) as u8;
     bytes[1] = ((n >> 8) & 0xFF) as u8;
     bytes[2] = ((n >> 16) & 0xFF) as u8;
     bytes[3] = ((n >> 24) & 0xFF) as u8;
 
-    writer.write(&bytes[..]).map_err(DeviceError::Io)
+    writer.write(&bytes[..]).await.map_err(DeviceError::Io)
 }
 
-fn read_response(stream: &mut TcpStream, has_output: bool, has_length: bool) -> Result<Vec<u8>> {
+async fn read_response(
+    stream: &mut TcpStream,
+    has_output: bool,
+    has_length: bool,
+) -> Result<Vec<u8>> {
     let mut bytes: [u8; 1024] = [0; 1024];
 
-    stream.read_exact(&mut bytes[0..4])?;
+    stream.read_exact(&mut bytes[0..4]).await?;
 
     if !bytes.starts_with(SyncCommand::Okay.code()) {
-        let n = bytes.len().min(read_length(stream)?);
-        stream.read_exact(&mut bytes[0..n])?;
+        let n = bytes.len().min(read_length(stream).await?);
+        stream.read_exact(&mut bytes[0..n]).await?;
 
         let message = std::str::from_utf8(&bytes[0..n]).map(|s| format!("adb error: {}", s))?;
 
@@ -174,7 +182,7 @@ fn read_response(stream: &mut TcpStream, has_output: bool, has_length: bool) -> 
     let mut response = Vec::new();
 
     if has_output {
-        stream.read_to_end(&mut response)?;
+        stream.read_to_end(&mut response).await?;
 
         if response.starts_with(SyncCommand::Okay.code()) {
             // Sometimes the server produces OKAYOKAY.  Sometimes there is a transport OKAY and
@@ -197,7 +205,7 @@ fn read_response(stream: &mut TcpStream, has_output: bool, has_length: bool) -> 
                 let message = response.split_off(4);
                 let slice: &mut &[u8] = &mut &*response;
 
-                let n = read_length(slice)?;
+                let n = read_length(slice).await?;
                 if n != message.len() {
                     warn!("adb server response contained hexstring len {} but remaining message length is {}", n, message.len());
                 }
@@ -235,10 +243,6 @@ pub struct Host {
     pub host: Option<String>,
     /// The TCP port to connect to.  Defaults to `5037`.
     pub port: Option<u16>,
-    /// Optional TCP read timeout duration.  Defaults to 2s.
-    pub read_timeout: Option<Duration>,
-    /// Optional TCP write timeout duration.  Defaults to 2s.
-    pub write_timeout: Option<Duration>,
 }
 
 impl Default for Host {
@@ -246,8 +250,6 @@ impl Default for Host {
         Host {
             host: Some("localhost".to_string()),
             port: Some(5037),
-            read_timeout: Some(Duration::from_secs(2)),
-            write_timeout: Some(Duration::from_secs(2)),
         }
     }
 }
@@ -257,13 +259,14 @@ impl Host {
     ///
     /// If multiple devices are online, and no device has been specified,
     /// the `ANDROID_SERIAL` environment variable can be used to select one.
-    pub fn device_or_default<T: AsRef<str>>(
+    pub async fn device_or_default<T: AsRef<str>>(
         self,
         device_serial: Option<&T>,
         storage: AndroidStorageInput,
     ) -> Result<Device> {
         let serials: Vec<String> = self
-            .devices::<Vec<_>>()?
+            .devices::<Vec<_>>()
+            .await?
             .into_iter()
             .map(|d| d.serial)
             .collect();
@@ -276,7 +279,7 @@ impl Host {
                 return Err(DeviceError::UnknownDevice(serial.clone()));
             }
 
-            return Device::new(self, serial.to_owned(), storage);
+            return Device::new(self, serial.to_owned(), storage).await;
         }
 
         if serials.len() > 1 {
@@ -284,33 +287,34 @@ impl Host {
         }
 
         if let Some(ref serial) = serials.first() {
-            return Device::new(self, serial.to_owned().to_string(), storage);
+            return Device::new(self, serial.to_owned().to_string(), storage).await;
         }
 
         Err(DeviceError::Adb("No Android devices are online".to_owned()))
     }
 
-    pub fn connect(&self) -> Result<TcpStream> {
+    pub async fn connect(&self) -> Result<TcpStream> {
         let stream = TcpStream::connect(format!(
             "{}:{}",
             self.host.clone().unwrap_or_else(|| "localhost".to_owned()),
             self.port.unwrap_or(5037)
-        ))?;
-        stream.set_read_timeout(self.read_timeout)?;
-        stream.set_write_timeout(self.write_timeout)?;
+        ))
+        .await?;
         Ok(stream)
     }
 
-    pub fn execute_command(
+    pub async fn execute_command(
         &self,
         command: &str,
         has_output: bool,
         has_length: bool,
     ) -> Result<String> {
-        let mut stream = self.connect()?;
+        let mut stream = self.connect().await?;
 
-        stream.write_all(encode_message(command)?.as_bytes())?;
-        let bytes = read_response(&mut stream, has_output, has_length)?;
+        stream
+            .write_all(encode_message(command)?.as_bytes())
+            .await?;
+        let bytes = read_response(&mut stream, has_output, has_length).await?;
         // TODO: should we assert no bytes were read?
 
         let response = std::str::from_utf8(&bytes)?;
@@ -318,22 +322,23 @@ impl Host {
         Ok(response.to_owned())
     }
 
-    pub fn execute_host_command(
+    pub async fn execute_host_command(
         &self,
         host_command: &str,
         has_length: bool,
         has_output: bool,
     ) -> Result<String> {
         self.execute_command(&format!("host:{}", host_command), has_output, has_length)
+            .await
     }
 
-    pub fn features<B: FromIterator<String>>(&self) -> Result<B> {
-        let features = self.execute_host_command("features", true, true)?;
+    pub async fn features<B: FromIterator<String>>(&self) -> Result<B> {
+        let features = self.execute_host_command("features", true, true).await?;
         Ok(features.split(',').map(|x| x.to_owned()).collect())
     }
 
-    pub fn devices<B: FromIterator<DeviceInfo>>(&self) -> Result<B> {
-        let response = self.execute_host_command("devices-l", true, true)?;
+    pub async fn devices<B: FromIterator<DeviceInfo>>(&self) -> Result<B> {
+        let response = self.execute_host_command("devices-l", true, true).await?;
 
         let infos: B = response.lines().filter_map(parse_device_info).collect();
 
@@ -390,7 +395,11 @@ pub struct RemoteFileMetadata {
 }
 
 impl Device {
-    pub fn new(host: Host, serial: DeviceSerial, storage: AndroidStorageInput) -> Result<Device> {
+    pub async fn new(
+        host: Host,
+        serial: DeviceSerial,
+        storage: AndroidStorageInput,
+    ) -> Result<Device> {
         let mut device = Device {
             host,
             serial,
@@ -410,12 +419,15 @@ impl Device {
         let uid_check = |id: String| id.contains("uid=0");
         device.adbd_root = device
             .execute_host_shell_command("id")
+            .await
             .map_or(false, uid_check);
         device.su_0_root = device
             .execute_host_shell_command("su 0 id")
+            .await
             .map_or(false, uid_check);
         device.su_c_root = device
             .execute_host_shell_command("su -c id")
+            .await
             .map_or(false, uid_check);
         device.is_rooted = device.adbd_root || device.su_0_root || device.su_c_root;
 
@@ -430,7 +442,9 @@ impl Device {
             info!("Device is rooted");
 
             // Set Permissive=1 if we have root.
-            device.execute_host_shell_command("setenforce permissive")?;
+            device
+                .execute_host_shell_command("setenforce permissive")
+                .await?;
         } else {
             info!("Device is unrooted");
         }
@@ -438,21 +452,23 @@ impl Device {
         Ok(device)
     }
 
-    pub fn clear_app_data(&self, package: &str) -> Result<bool> {
+    pub async fn clear_app_data(&self, package: &str) -> Result<bool> {
         self.execute_host_shell_command(&format!("pm clear {}", package))
+            .await
             .map(|v| v.contains("Success"))
     }
 
-    pub fn create_dir(&self, path: &UnixPath) -> Result<()> {
+    pub async fn create_dir(&self, path: &UnixPath) -> Result<()> {
         debug!("Creating {}", path.display());
 
         let enable_run_as = self.enable_run_as_for_path(path);
-        self.execute_host_shell_command_as(&format!("mkdir -p {}", path.display()), enable_run_as)?;
+        self.execute_host_shell_command_as(&format!("mkdir -p {}", path.display()), enable_run_as)
+            .await?;
 
         Ok(())
     }
 
-    pub fn chmod(&self, path: &UnixPath, mask: &str, recursive: bool) -> Result<()> {
+    pub async fn chmod(&self, path: &UnixPath, mask: &str, recursive: bool) -> Result<()> {
         let enable_run_as = self.enable_run_as_for_path(path);
 
         let recursive = match recursive {
@@ -463,29 +479,34 @@ impl Device {
         self.execute_host_shell_command_as(
             &format!("chmod {} {} {}", recursive, mask, path.display()),
             enable_run_as,
-        )?;
+        )
+        .await?;
 
         Ok(())
     }
 
-    pub fn execute_host_command(
+    pub async fn execute_host_command(
         &self,
         command: &str,
         has_output: bool,
         has_length: bool,
     ) -> Result<String> {
-        let mut stream = self.host.connect()?;
+        let mut stream = self.host.connect().await?;
 
         let switch_command = format!("host:transport:{}", self.serial);
         trace!("execute_host_command: >> {:?}", &switch_command);
-        stream.write_all(encode_message(&switch_command)?.as_bytes())?;
-        let _bytes = read_response(&mut stream, false, false)?;
+        stream
+            .write_all(encode_message(&switch_command)?.as_bytes())
+            .await?;
+        let _bytes = read_response(&mut stream, false, false).await?;
         trace!("execute_host_command: << {:?}", _bytes);
         // TODO: should we assert no bytes were read?
 
         trace!("execute_host_command: >> {:?}", &command);
-        stream.write_all(encode_message(command)?.as_bytes())?;
-        let bytes = read_response(&mut stream, has_output, has_length)?;
+        stream
+            .write_all(encode_message(command)?.as_bytes())
+            .await?;
+        let bytes = read_response(&mut stream, has_output, has_length).await?;
         let response = std::str::from_utf8(&bytes)?;
         trace!("execute_host_command: << {:?}", response);
 
@@ -504,54 +525,55 @@ impl Device {
         }
     }
 
-    pub fn execute_host_shell_command(&self, shell_command: &str) -> Result<String> {
+    pub async fn execute_host_shell_command(&self, shell_command: &str) -> Result<String> {
         self.execute_host_shell_command_as(shell_command, false)
+            .await
     }
 
-    pub fn execute_host_shell_command_as(
+    pub async fn execute_host_shell_command_as(
         &self,
         shell_command: &str,
         enable_run_as: bool,
     ) -> Result<String> {
         // We don't want to duplicate su invocations.
         if shell_command.starts_with("su") {
-            return self.execute_host_command(&format!("shell:{}", shell_command), true, false);
+            return self
+                .execute_host_command(&format!("shell:{}", shell_command), true, false)
+                .await;
         }
 
         let has_outer_quotes = shell_command.starts_with('"') && shell_command.ends_with('"')
             || shell_command.starts_with('\'') && shell_command.ends_with('\'');
 
         if self.adbd_root {
-            return self.execute_host_command(&format!("shell:{}", shell_command), true, false);
+            return self
+                .execute_host_command(&format!("shell:{}", shell_command), true, false)
+                .await;
         }
 
         if self.su_0_root {
-            return self.execute_host_command(
-                &format!("shell:su 0 {}", shell_command),
-                true,
-                false,
-            );
+            return self
+                .execute_host_command(&format!("shell:su 0 {}", shell_command), true, false)
+                .await;
         }
 
         if self.su_c_root {
             if has_outer_quotes {
-                return self.execute_host_command(
-                    &format!("shell:su -c {}", shell_command),
-                    true,
-                    false,
-                );
+                return self
+                    .execute_host_command(&format!("shell:su -c {}", shell_command), true, false)
+                    .await;
             }
 
             if SYNC_REGEX.is_match(shell_command) {
                 let arg: &str = &shell_command.replace('\'', "'\"'\"'")[..];
-                return self.execute_host_command(&format!("shell:su -c '{}'", arg), true, false);
+                return self
+                    .execute_host_command(&format!("shell:su -c '{}'", arg), true, false)
+                    .await;
             }
 
-            return self.execute_host_command(
-                &format!("shell:su -c \"{}\"", shell_command),
-                true,
-                false,
-            );
+            return self
+                .execute_host_command(&format!("shell:su -c \"{}\"", shell_command), true, false)
+                .await;
         }
 
         // Execute command as package
@@ -562,38 +584,46 @@ impl Device {
                 .ok_or(DeviceError::MissingPackage)?;
 
             if has_outer_quotes {
-                return self.execute_host_command(
-                    &format!("shell:run-as {} {}", run_as_package, shell_command),
-                    true,
-                    false,
-                );
+                return self
+                    .execute_host_command(
+                        &format!("shell:run-as {} {}", run_as_package, shell_command),
+                        true,
+                        false,
+                    )
+                    .await;
             }
 
             if SYNC_REGEX.is_match(shell_command) {
                 let arg: &str = &shell_command.replace('\'', "'\"'\"'")[..];
-                return self.execute_host_command(
-                    &format!("shell:run-as {} {}", run_as_package, arg),
-                    true,
-                    false,
-                );
+                return self
+                    .execute_host_command(
+                        &format!("shell:run-as {} {}", run_as_package, arg),
+                        true,
+                        false,
+                    )
+                    .await;
             }
 
-            return self.execute_host_command(
-                &format!("shell:run-as {} \"{}\"", run_as_package, shell_command),
-                true,
-                false,
-            );
+            return self
+                .execute_host_command(
+                    &format!("shell:run-as {} \"{}\"", run_as_package, shell_command),
+                    true,
+                    false,
+                )
+                .await;
         }
 
         self.execute_host_command(&format!("shell:{}", shell_command), true, false)
+            .await
     }
 
-    pub fn is_app_installed(&self, package: &str) -> Result<bool> {
+    pub async fn is_app_installed(&self, package: &str) -> Result<bool> {
         self.execute_host_shell_command(&format!("pm path {}", package))
+            .await
             .map(|v| v.contains("package:"))
     }
 
-    pub fn launch<T: AsRef<str>>(
+    pub async fn launch<T: AsRef<str>>(
         &self,
         package: &str,
         activity: &str,
@@ -611,21 +641,23 @@ impl Device {
         }
 
         self.execute_host_shell_command(&am_start)
+            .await
             .map(|v| v.contains("Complete"))
     }
 
-    pub fn force_stop(&self, package: &str) -> Result<()> {
+    pub async fn force_stop(&self, package: &str) -> Result<()> {
         debug!("Force stopping Android package: {}", package);
         self.execute_host_shell_command(&format!("am force-stop {}", package))
+            .await
             .and(Ok(()))
     }
 
-    pub fn forward_port(&self, local: u16, remote: u16) -> Result<u16> {
+    pub async fn forward_port(&self, local: u16, remote: u16) -> Result<u16> {
         let command = format!(
             "host-serial:{}:forward:tcp:{};tcp:{}",
             self.serial, local, remote
         );
-        let response = self.host.execute_command(&command, true, false)?;
+        let response = self.host.execute_command(&command, true, false).await?;
 
         if local == 0 {
             Ok(response.parse::<u16>()?)
@@ -634,20 +666,23 @@ impl Device {
         }
     }
 
-    pub fn kill_forward_port(&self, local: u16) -> Result<()> {
+    pub async fn kill_forward_port(&self, local: u16) -> Result<()> {
         let command = format!("host-serial:{}:killforward:tcp:{}", self.serial, local);
-        self.execute_host_command(&command, true, false).and(Ok(()))
-    }
-
-    pub fn kill_forward_all_ports(&self) -> Result<()> {
-        let command = format!("host-serial:{}:killforward-all", self.serial);
-        self.execute_host_command(&command, false, false)
+        self.execute_host_command(&command, true, false)
+            .await
             .and(Ok(()))
     }
 
-    pub fn reverse_port(&self, remote: u16, local: u16) -> Result<u16> {
+    pub async fn kill_forward_all_ports(&self) -> Result<()> {
+        let command = format!("host-serial:{}:killforward-all", self.serial);
+        self.execute_host_command(&command, false, false)
+            .await
+            .and(Ok(()))
+    }
+
+    pub async fn reverse_port(&self, remote: u16, local: u16) -> Result<u16> {
         let command = format!("reverse:forward:tcp:{};tcp:{}", remote, local);
-        let response = self.execute_host_command(&command, true, false)?;
+        let response = self.execute_host_command(&command, true, false).await?;
 
         if remote == 0 {
             Ok(response.parse::<u16>()?)
@@ -656,25 +691,28 @@ impl Device {
         }
     }
 
-    pub fn kill_reverse_port(&self, remote: u16) -> Result<()> {
+    pub async fn kill_reverse_port(&self, remote: u16) -> Result<()> {
         let command = format!("reverse:killforward:tcp:{}", remote);
-        self.execute_host_command(&command, true, true).and(Ok(()))
-    }
-
-    pub fn kill_reverse_all_ports(&self) -> Result<()> {
-        let command = "reverse:killforward-all".to_owned();
-        self.execute_host_command(&command, false, false)
+        self.execute_host_command(&command, true, true)
+            .await
             .and(Ok(()))
     }
 
-    pub fn list_dir(&self, src: &UnixPath) -> Result<Vec<RemoteDirEntry>> {
+    pub async fn kill_reverse_all_ports(&self) -> Result<()> {
+        let command = "reverse:killforward-all".to_owned();
+        self.execute_host_command(&command, false, false)
+            .await
+            .and(Ok(()))
+    }
+
+    pub async fn list_dir(&self, src: &UnixPath) -> Result<Vec<RemoteDirEntry>> {
         let src = src.to_path_buf();
         let mut queue = vec![(src.clone(), 0, "".to_string())];
 
         let mut listings = Vec::new();
 
         while let Some((next, depth, prefix)) = queue.pop() {
-            for listing in self.list_dir_flat(&next, depth, prefix)? {
+            for listing in self.list_dir_flat(&next, depth, prefix).await? {
                 if listing.metadata == RemoteMetadata::RemoteDir {
                     let mut child = src.clone();
                     child.push(listing.name.clone());
@@ -688,31 +726,31 @@ impl Device {
         Ok(listings)
     }
 
-    fn list_dir_flat(
+    async fn list_dir_flat(
         &self,
         src: &UnixPath,
         depth: usize,
         prefix: String,
     ) -> Result<Vec<RemoteDirEntry>> {
         // Implement the ADB protocol to list a directory from the device.
-        let mut stream = self.host.connect()?;
+        let mut stream = self.host.connect().await?;
 
         // Send "host:transport" command with device serial
         let message = encode_message(&format!("host:transport:{}", self.serial))?;
-        stream.write_all(message.as_bytes())?;
-        let _bytes = read_response(&mut stream, false, true)?;
+        stream.write_all(message.as_bytes()).await?;
+        let _bytes = read_response(&mut stream, false, true).await?;
 
         // Send "sync:" command to initialize file transfer
         let message = encode_message("sync:")?;
-        stream.write_all(message.as_bytes())?;
-        let _bytes = read_response(&mut stream, false, true)?;
+        stream.write_all(message.as_bytes()).await?;
+        let _bytes = read_response(&mut stream, false, true).await?;
 
         // Send "LIST" command with name of the directory
-        stream.write_all(SyncCommand::List.code())?;
+        stream.write_all(SyncCommand::List.code()).await?;
         let args_ = format!("{}", src.display());
         let args = args_.as_bytes();
-        write_length_little_endian(&mut stream, args.len())?;
-        stream.write_all(args)?;
+        write_length_little_endian(&mut stream, args.len()).await?;
+        stream.write_all(args).await?;
 
         // Use the maximum 64KB buffer to transfer the file contents.
         let mut buf = [0; 64 * 1024];
@@ -721,7 +759,7 @@ impl Device {
 
         // Read "DENT" command one or more times for the directory entries
         loop {
-            stream.read_exact(&mut buf[0..4])?;
+            stream.read_exact(&mut buf[0..4]).await?;
 
             if &buf[0..4] == SyncCommand::Dent.code() {
                 // From https://github.com/cstyan/adbDocumentation/blob/6d025b3e4af41be6f93d37f516a8ac7913688623/README.md:
@@ -733,11 +771,11 @@ impl Device {
                 // A four-byte integer representing last modified time in seconds since Unix Epoch.
                 // A four-byte integer representing file name length.
                 // A utf-8 string representing the file name.
-                let mode = read_length_little_endian(&mut stream)?;
-                let size = read_length_little_endian(&mut stream)?;
-                let _time = read_length_little_endian(&mut stream)?;
-                let name_length = read_length_little_endian(&mut stream)?;
-                stream.read_exact(&mut buf[0..name_length])?;
+                let mode = read_length_little_endian(&mut stream).await?;
+                let size = read_length_little_endian(&mut stream).await?;
+                let _time = read_length_little_endian(&mut stream).await?;
+                let name_length = read_length_little_endian(&mut stream).await?;
+                stream.read_exact(&mut buf[0..name_length]).await?;
 
                 let mut name = std::str::from_utf8(&buf[0..name_length])?.to_owned();
 
@@ -769,9 +807,9 @@ impl Device {
                 // "DONE" command indicates end of file transfer
                 break;
             } else if &buf[0..4] == SyncCommand::Fail.code() {
-                let n = buf.len().min(read_length_little_endian(&mut stream)?);
+                let n = buf.len().min(read_length_little_endian(&mut stream).await?);
 
-                stream.read_exact(&mut buf[0..n])?;
+                stream.read_exact(&mut buf[0..n]).await?;
 
                 let message = std::str::from_utf8(&buf[0..n])
                     .map(|s| format!("adb error: {}", s))
@@ -786,50 +824,51 @@ impl Device {
         Ok(listings)
     }
 
-    pub fn path_exists(&self, path: &UnixPath, enable_run_as: bool) -> Result<bool> {
+    pub async fn path_exists(&self, path: &UnixPath, enable_run_as: bool) -> Result<bool> {
         self.execute_host_shell_command_as(format!("ls {}", path.display()).as_str(), enable_run_as)
+            .await
             .map(|path| !path.contains("No such file or directory"))
     }
 
-    pub fn pull(&self, src: &UnixPath, buffer: &mut dyn Write) -> Result<()> {
+    pub async fn pull<W: AsyncWrite + Unpin>(&self, src: &UnixPath, buffer: &mut W) -> Result<()> {
         // Implement the ADB protocol to receive a file from the device.
-        let mut stream = self.host.connect()?;
+        let mut stream = self.host.connect().await?;
 
         // Send "host:transport" command with device serial
         let message = encode_message(&format!("host:transport:{}", self.serial))?;
-        stream.write_all(message.as_bytes())?;
-        let _bytes = read_response(&mut stream, false, true)?;
+        stream.write_all(message.as_bytes()).await?;
+        let _bytes = read_response(&mut stream, false, true).await?;
 
         // Send "sync:" command to initialize file transfer
         let message = encode_message("sync:")?;
-        stream.write_all(message.as_bytes())?;
-        let _bytes = read_response(&mut stream, false, true)?;
+        stream.write_all(message.as_bytes()).await?;
+        let _bytes = read_response(&mut stream, false, true).await?;
 
         // Send "RECV" command with name of the file
-        stream.write_all(SyncCommand::Recv.code())?;
+        stream.write_all(SyncCommand::Recv.code()).await?;
         let args_string = format!("{}", src.display());
         let args = args_string.as_bytes();
-        write_length_little_endian(&mut stream, args.len())?;
-        stream.write_all(args)?;
+        write_length_little_endian(&mut stream, args.len()).await?;
+        stream.write_all(args).await?;
 
         // Use the maximum 64KB buffer to transfer the file contents.
         let mut buf = [0; 64 * 1024];
 
         // Read "DATA" command one or more times for the file content
         loop {
-            stream.read_exact(&mut buf[0..4])?;
+            stream.read_exact(&mut buf[0..4]).await?;
 
             if &buf[0..4] == SyncCommand::Data.code() {
-                let len = read_length_little_endian(&mut stream)?;
-                stream.read_exact(&mut buf[0..len])?;
-                buffer.write_all(&buf[0..len])?;
+                let len = read_length_little_endian(&mut stream).await?;
+                stream.read_exact(&mut buf[0..len]).await?;
+                buffer.write_all(&buf[0..len]).await?;
             } else if &buf[0..4] == SyncCommand::Done.code() {
                 // "DONE" command indicates end of file transfer
                 break;
             } else if &buf[0..4] == SyncCommand::Fail.code() {
-                let n = buf.len().min(read_length_little_endian(&mut stream)?);
+                let n = buf.len().min(read_length_little_endian(&mut stream).await?);
 
-                stream.read_exact(&mut buf[0..n])?;
+                stream.read_exact(&mut buf[0..n]).await?;
 
                 let message = std::str::from_utf8(&buf[0..n])
                     .map(|s| format!("adb error: {}", s))
@@ -844,11 +883,11 @@ impl Device {
         Ok(())
     }
 
-    pub fn pull_dir(&self, src: &UnixPath, dest_dir: &Path) -> Result<()> {
+    pub async fn pull_dir(&self, src: &UnixPath, dest_dir: &Path) -> Result<()> {
         let src = src.to_path_buf();
         let dest_dir = dest_dir.to_path_buf();
 
-        for entry in self.list_dir(&src)? {
+        for entry in self.list_dir(&src).await? {
             match entry.metadata {
                 RemoteMetadata::RemoteSymlink => {} // Ignored.
                 RemoteMetadata::RemoteDir => {
@@ -863,7 +902,7 @@ impl Device {
                     let mut d = dest_dir.clone();
                     d.push(&entry.name);
 
-                    self.pull(&s, &mut File::create(d)?)?;
+                    self.pull(&s, &mut File::create(d).await?).await?;
                 }
             }
         }
@@ -871,7 +910,12 @@ impl Device {
         Ok(())
     }
 
-    pub fn push(&self, buffer: &mut dyn Read, dest: &UnixPath, mode: u32) -> Result<()> {
+    pub async fn push<R: AsyncRead + Unpin>(
+        &self,
+        buffer: &mut R,
+        dest: &UnixPath,
+        mode: u32,
+    ) -> Result<()> {
         // Implement the ADB protocol to send a file to the device.
         // The protocol consists of the following steps:
         // * Send "host:transport" command with device serial
@@ -902,7 +946,7 @@ impl Device {
         let mut root: Option<&UnixPath> = None;
 
         while let Some(path) = current {
-            if self.path_exists(path, enable_run_as)? {
+            if self.path_exists(path, enable_run_as).await? {
                 break;
             }
             if leaf.is_none() {
@@ -913,43 +957,43 @@ impl Device {
         }
 
         if let Some(path) = leaf {
-            self.create_dir(path)?;
+            self.create_dir(path).await?;
         }
 
         if let Some(path) = root {
-            self.chmod(path, "777", true)?;
+            self.chmod(path, "777", true).await?;
         }
 
-        let mut stream = self.host.connect()?;
+        let mut stream = self.host.connect().await?;
 
         let message = encode_message(&format!("host:transport:{}", self.serial))?;
-        stream.write_all(message.as_bytes())?;
-        let _bytes = read_response(&mut stream, false, true)?;
+        stream.write_all(message.as_bytes()).await?;
+        let _bytes = read_response(&mut stream, false, true).await?;
 
         let message = encode_message("sync:")?;
-        stream.write_all(message.as_bytes())?;
-        let _bytes = read_response(&mut stream, false, true)?;
+        stream.write_all(message.as_bytes()).await?;
+        let _bytes = read_response(&mut stream, false, true).await?;
 
-        stream.write_all(SyncCommand::Send.code())?;
+        stream.write_all(SyncCommand::Send.code()).await?;
         let args_ = format!("{},{}", dest1.display(), mode);
         let args = args_.as_bytes();
-        write_length_little_endian(&mut stream, args.len())?;
-        stream.write_all(args)?;
+        write_length_little_endian(&mut stream, args.len()).await?;
+        stream.write_all(args).await?;
 
         // Use a 32KB buffer to transfer the file contents
         // TODO: Maybe adjust to maxdata (256KB)
         let mut buf = [0; 32 * 1024];
 
         loop {
-            let len = buffer.read(&mut buf)?;
+            let len = buffer.read(&mut buf).await?;
 
             if len == 0 {
                 break;
             }
 
-            stream.write_all(SyncCommand::Data.code())?;
-            write_length_little_endian(&mut stream, len)?;
-            stream.write_all(&buf[0..len])?;
+            stream.write_all(SyncCommand::Data.code()).await?;
+            write_length_little_endian(&mut stream, len).await?;
+            stream.write_all(&buf[0..len]).await?;
         }
 
         // https://android.googlesource.com/platform/system/core/+/master/adb/SYNC.TXT#66
@@ -963,32 +1007,34 @@ impl Device {
             .as_secs()
             & 0xFFFF_FFFF) as u32;
 
-        stream.write_all(SyncCommand::Done.code())?;
-        write_length_little_endian(&mut stream, time as usize)?;
+        stream.write_all(SyncCommand::Done.code()).await?;
+        write_length_little_endian(&mut stream, time as usize).await?;
 
         // Status.
-        stream.read_exact(&mut buf[0..4])?;
+        stream.read_exact(&mut buf[0..4]).await?;
 
         if buf.starts_with(SyncCommand::Okay.code()) {
             if enable_run_as {
                 // Use cp -a to preserve the permissions set by push.
-                let result = self.execute_host_shell_command_as(
-                    format!("cp -aR {} {}", dest1.display(), dest.display()).as_str(),
-                    enable_run_as,
-                );
-                if self.remove(dest1).is_err() {
+                let result = self
+                    .execute_host_shell_command_as(
+                        format!("cp -aR {} {}", dest1.display(), dest.display()).as_str(),
+                        enable_run_as,
+                    )
+                    .await;
+                if self.remove(dest1).await.is_err() {
                     warn!("Failed to remove {}", dest1.display());
                 }
                 result?;
             }
             Ok(())
         } else if buf.starts_with(SyncCommand::Fail.code()) {
-            if enable_run_as && self.remove(dest1).is_err() {
+            if enable_run_as && self.remove(dest1).await.is_err() {
                 warn!("Failed to remove {}", dest1.display());
             }
-            let n = buf.len().min(read_length_little_endian(&mut stream)?);
+            let n = buf.len().min(read_length_little_endian(&mut stream).await?);
 
-            stream.read_exact(&mut buf[0..n])?;
+            stream.read_exact(&mut buf[0..n]).await?;
 
             let message = std::str::from_utf8(&buf[0..n])
                 .map(|s| format!("adb error: {}", s))
@@ -996,14 +1042,14 @@ impl Device {
 
             Err(DeviceError::Adb(message))
         } else {
-            if self.remove(dest1).is_err() {
+            if self.remove(dest1).await.is_err() {
                 warn!("Failed to remove {}", dest1.display());
             }
             Err(DeviceError::Adb("FAIL (unknown)".to_owned()))
         }
     }
 
-    pub fn push_dir(&self, source: &Path, dest_dir: &UnixPath, mode: u32) -> Result<()> {
+    pub async fn push_dir(&self, source: &Path, dest_dir: &UnixPath, mode: u32) -> Result<()> {
         debug!("Pushing {} to {}", source.display(), dest_dir.display());
 
         let walker = WalkDir::new(source).follow_links(false).into_iter();
@@ -1016,26 +1062,27 @@ impl Device {
                 continue;
             }
 
-            let mut file = File::open(path)?;
+            let mut file = File::open(path).await?;
 
             let tail = path
                 .strip_prefix(source)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
             let dest = append_components(dest_dir, tail)?;
-            self.push(&mut file, &dest, mode)?;
+            self.push(&mut file, &dest, mode).await?;
         }
 
         Ok(())
     }
 
-    pub fn remove(&self, path: &UnixPath) -> Result<()> {
+    pub async fn remove(&self, path: &UnixPath) -> Result<()> {
         debug!("Deleting {}", path.display());
 
         self.execute_host_shell_command_as(
             &format!("rm -rf {}", path.display()),
             self.enable_run_as_for_path(path),
-        )?;
+        )
+        .await?;
 
         Ok(())
     }
