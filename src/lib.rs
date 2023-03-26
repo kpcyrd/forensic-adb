@@ -33,8 +33,9 @@ pub type Result<T> = std::result::Result<T, DeviceError>;
 
 static SYNC_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^A-Za-z0-9_@%+=:,./-]").unwrap());
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum AndroidStorageInput {
+    #[default]
     Auto,
     App,
     Internal,
@@ -52,12 +53,6 @@ impl FromStr for AndroidStorageInput {
             "sdcard" => Ok(AndroidStorageInput::Sdcard),
             _ => Err(DeviceError::InvalidStorage),
         }
-    }
-}
-
-impl Default for AndroidStorageInput {
-    fn default() -> Self {
-        AndroidStorageInput::Auto
     }
 }
 
