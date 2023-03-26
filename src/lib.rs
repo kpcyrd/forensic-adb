@@ -8,7 +8,7 @@ pub mod shell;
 #[cfg(test)]
 pub mod test;
 
-use log::{debug, info, trace, warn};
+use log::{debug, trace, warn};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::BTreeMap;
@@ -350,18 +350,6 @@ pub struct Device {
     /// Serial number uniquely identifying this ADB device.
     pub serial: DeviceSerial,
 
-    /// adb running as root
-    pub adbd_root: bool,
-
-    /// Flag for rooted device
-    pub is_rooted: bool,
-
-    /// "su 0" command available
-    pub su_0_root: bool,
-
-    /// "su -c" command available
-    pub su_c_root: bool,
-
     pub run_as_package: Option<String>,
 
     pub storage: AndroidStorage,
@@ -398,33 +386,13 @@ impl Device {
         let mut device = Device {
             host,
             serial,
-            adbd_root: false,
-            is_rooted: false,
             run_as_package: None,
             storage: AndroidStorage::App,
-            su_c_root: false,
-            su_0_root: false,
             tempfile: UnixPathBuf::from("/data/local/tmp"),
         };
         device
             .tempfile
             .push(Uuid::new_v4().as_hyphenated().to_string());
-
-        // check for rooted devices
-        let uid_check = |id: String| id.contains("uid=0");
-        device.adbd_root = device
-            .execute_host_shell_command("id")
-            .await
-            .map_or(false, uid_check);
-        device.su_0_root = device
-            .execute_host_shell_command("su 0 id")
-            .await
-            .map_or(false, uid_check);
-        device.su_c_root = device
-            .execute_host_shell_command("su -c id")
-            .await
-            .map_or(false, uid_check);
-        device.is_rooted = device.adbd_root || device.su_0_root || device.su_c_root;
 
         device.storage = match storage {
             AndroidStorageInput::App => AndroidStorage::App,
@@ -432,17 +400,6 @@ impl Device {
             AndroidStorageInput::Sdcard => AndroidStorage::Sdcard,
             AndroidStorageInput::Auto => AndroidStorage::Sdcard,
         };
-
-        if device.is_rooted {
-            info!("Device is rooted");
-
-            // Set Permissive=1 if we have root.
-            device
-                .execute_host_shell_command("setenforce permissive")
-                .await?;
-        } else {
-            info!("Device is unrooted");
-        }
 
         Ok(device)
     }
@@ -539,37 +496,6 @@ impl Device {
 
         let has_outer_quotes = shell_command.starts_with('"') && shell_command.ends_with('"')
             || shell_command.starts_with('\'') && shell_command.ends_with('\'');
-
-        if self.adbd_root {
-            return self
-                .execute_host_command(&format!("shell:{}", shell_command), true, false)
-                .await;
-        }
-
-        if self.su_0_root {
-            return self
-                .execute_host_command(&format!("shell:su 0 {}", shell_command), true, false)
-                .await;
-        }
-
-        if self.su_c_root {
-            if has_outer_quotes {
-                return self
-                    .execute_host_command(&format!("shell:su -c {}", shell_command), true, false)
-                    .await;
-            }
-
-            if SYNC_REGEX.is_match(shell_command) {
-                let arg: &str = &shell_command.replace('\'', "'\"'\"'")[..];
-                return self
-                    .execute_host_command(&format!("shell:su -c '{}'", arg), true, false)
-                    .await;
-            }
-
-            return self
-                .execute_host_command(&format!("shell:su -c \"{}\"", shell_command), true, false)
-                .await;
-        }
 
         // Execute command as package
         if enable_run_as {
