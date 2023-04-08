@@ -224,7 +224,7 @@ async fn read_response(
 }
 
 /// Detailed information about an ADB device.
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct DeviceInfo {
     pub serial: DeviceSerial,
     pub info: BTreeMap<String, String>,
