@@ -1,6 +1,6 @@
 [package]
 name = "forensic-adb"
-version = "0.6.1"
+version = "0.6.2"
 authors = ["Mozilla", "kpcyrd <git@rxv.cc>"]
 description = "Tokio based client library for the Android Debug Bridge (adb) based on mozdevice"
 keywords = [
