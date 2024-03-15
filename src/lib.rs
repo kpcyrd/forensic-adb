@@ -442,7 +442,7 @@ impl Device {
         command: &str,
         has_output: bool,
         has_length: bool,
-    ) -> Result<String> {
+    ) -> Result<Vec<u8>> {
         let mut stream = self.host.connect().await?;
 
         let switch_command = format!("host:transport:{}", self.serial);
@@ -459,8 +459,22 @@ impl Device {
             .write_all(encode_message(command)?.as_bytes())
             .await?;
         let bytes = read_response(&mut stream, has_output, has_length).await?;
+        trace!("execute_host_command: << {:?}", bstr::BStr::new(&bytes));
+
+        Ok(bytes)
+    }
+
+    pub async fn execute_host_command_to_string(
+        &self,
+        command: &str,
+        has_output: bool,
+        has_length: bool,
+    ) -> Result<String> {
+        let bytes = self
+            .execute_host_command(command, has_output, has_length)
+            .await?;
+
         let response = std::str::from_utf8(&bytes)?;
-        trace!("execute_host_command: << {:?}", response);
 
         // Unify new lines by removing possible carriage returns
         Ok(response.replace("\r\n", "\n"))
@@ -490,7 +504,7 @@ impl Device {
         // We don't want to duplicate su invocations.
         if shell_command.starts_with("su") {
             return self
-                .execute_host_command(&format!("shell:{}", shell_command), true, false)
+                .execute_host_command_to_string(&format!("shell:{}", shell_command), true, false)
                 .await;
         }
 
@@ -506,7 +520,7 @@ impl Device {
 
             if has_outer_quotes {
                 return self
-                    .execute_host_command(
+                    .execute_host_command_to_string(
                         &format!("shell:run-as {} {}", run_as_package, shell_command),
                         true,
                         false,
@@ -517,7 +531,7 @@ impl Device {
             if SYNC_REGEX.is_match(shell_command) {
                 let arg: &str = &shell_command.replace('\'', "'\"'\"'")[..];
                 return self
-                    .execute_host_command(
+                    .execute_host_command_to_string(
                         &format!("shell:run-as {} {}", run_as_package, arg),
                         true,
                         false,
@@ -526,7 +540,7 @@ impl Device {
             }
 
             return self
-                .execute_host_command(
+                .execute_host_command_to_string(
                     &format!("shell:run-as {} \"{}\"", run_as_package, shell_command),
                     true,
                     false,
@@ -534,7 +548,7 @@ impl Device {
                 .await;
         }
 
-        self.execute_host_command(&format!("shell:{}", shell_command), true, false)
+        self.execute_host_command_to_string(&format!("shell:{}", shell_command), true, false)
             .await
     }
 
@@ -603,7 +617,9 @@ impl Device {
 
     pub async fn reverse_port(&self, remote: u16, local: u16) -> Result<u16> {
         let command = format!("reverse:forward:tcp:{};tcp:{}", remote, local);
-        let response = self.execute_host_command(&command, true, false).await?;
+        let response = self
+            .execute_host_command_to_string(&command, true, false)
+            .await?;
 
         if remote == 0 {
             Ok(response.parse::<u16>()?)

@@ -12,6 +12,7 @@ repository = "https://github.com/kpcyrd/forensic-adb"
 edition = "2021"
 
 [dependencies]
+bstr = "1.9.1"
 log = { version = "0.4", features = ["std"] }
 once_cell = "1.4.0"
 regex = { version = "1", default-features = false, features = ["perf", "std"] }
