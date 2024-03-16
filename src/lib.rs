@@ -497,12 +497,7 @@ impl Device {
     }
 
     pub async fn execute_host_exec_out_command(&self, shell_command: &str) -> Result<Vec<u8>> {
-        self
-            .execute_host_command(
-                &format!("exec:{}", shell_command),
-                true,
-                false,
-            )
+        self.execute_host_command(&format!("exec:{}", shell_command), true, false)
             .await
     }
 
