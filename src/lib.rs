@@ -480,33 +480,6 @@ impl Device {
         Ok(response.replace("\r\n", "\n"))
     }
 
-    pub async fn execute_host_command_raw(
-        &self,
-        command: &str,
-        has_output: bool,
-        has_length: bool,
-    ) -> Result<Vec<u8>> {
-        let mut stream = self.host.connect().await?;
-
-        let switch_command = format!("host:transport:{}", self.serial);
-        trace!("execute_host_command_raw: >> {:?}", &switch_command);
-        stream
-            .write_all(encode_message(&switch_command)?.as_bytes())
-            .await?;
-        let _bytes = read_response(&mut stream, false, false).await?;
-        trace!("execute_host_command_raw: << {:?}", _bytes);
-
-        trace!("execute_host_command_raw: >> {:?}", &command);
-        stream
-            .write_all(encode_message(command)?.as_bytes())
-            .await?;
-        let bytes = read_response(&mut stream, has_output, has_length).await?;
-        trace!("execute_host_command_raw: << {:?}", bytes);
-
-        Ok(bytes)
-    }
-
-
     pub fn enable_run_as_for_path(&self, path: &UnixPath) -> bool {
         match &self.run_as_package {
             Some(package) => {
@@ -525,7 +498,7 @@ impl Device {
 
     pub async fn execute_host_exec_out_command(&self, shell_command: &str) -> Result<Vec<u8>> {
         return self
-            .execute_host_command_raw(
+            .execute_host_command(
                 &format!("exec:{}", shell_command),
                 true,
                 false,
