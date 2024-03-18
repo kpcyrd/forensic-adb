@@ -342,7 +342,7 @@ impl Host {
 }
 
 /// Represents an ADB device.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Device {
     /// ADB host that controls this device.
     pub host: Host,
@@ -493,6 +493,11 @@ impl Device {
 
     pub async fn execute_host_shell_command(&self, shell_command: &str) -> Result<String> {
         self.execute_host_shell_command_as(shell_command, false)
+            .await
+    }
+
+    pub async fn execute_host_exec_out_command(&self, shell_command: &str) -> Result<Vec<u8>> {
+        self.execute_host_command(&format!("exec:{}", shell_command), true, false)
             .await
     }
 

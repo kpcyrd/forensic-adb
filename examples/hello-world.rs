@@ -1,3 +1,4 @@
+use bstr::ByteSlice;
 use forensic_adb::{AndroidStorageInput, DeviceError, Host};
 
 #[tokio::main]
@@ -12,8 +13,15 @@ async fn main() -> Result<(), DeviceError> {
         .await?;
     println!("Selected device: {:?}", device);
 
-    let output = device.execute_host_shell_command("id").await?;
-    println!("Received response: {:?}", output);
+    let output = device.execute_host_exec_out_command("id").await?;
+    println!("Received response: {:?}", bstr::BStr::new(&output));
+
+    let output = device
+        .execute_host_exec_out_command("pm list packages -f")
+        .await?;
+    for line in output.lines() {
+        println!("Received line: {:?}", bstr::BStr::new(line));
+    }
 
     Ok(())
 }
