@@ -17,13 +17,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up cargo cache
-      uses: actions/cache@v3
-      continue-on-error: false
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/bin/
@@ -42,13 +43,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up cargo cache
-      uses: actions/cache@v3
-      continue-on-error: false
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/bin/
@@ -65,8 +67,10 @@ jobs:
       run: cargo test --verbose
 
   fmt:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
