@@ -202,7 +202,11 @@ async fn read_response(
 
                 let n = read_length(slice).await?;
                 if n != message.len() {
-                    warn!("adb server response contained hexstring len {} but remaining message length is {}", n, message.len());
+                    warn!(
+                        "adb server response contained hexstring len {} but remaining message length is {}",
+                        n,
+                        message.len()
+                    );
                 }
 
                 trace!(
