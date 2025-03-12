@@ -17,7 +17,7 @@ use futures::future::BoxFuture;
 use std::collections::BTreeSet;
 use std::panic;
 use std::path::PathBuf;
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 
 #[tokio::test]
 async fn read_length_from_valid_string() {

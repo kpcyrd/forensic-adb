@@ -9,7 +9,7 @@ keywords = [
 ]
 license = "MPL-2.0"
 repository = "https://github.com/kpcyrd/forensic-adb"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 bstr = "1.9.1"
