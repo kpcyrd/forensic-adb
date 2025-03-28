@@ -364,9 +364,9 @@ pub struct Device {
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct RemoteDirEntry {
-    depth: usize,
-    metadata: RemoteMetadata,
-    name: String,
+    pub depth: usize,
+    pub metadata: RemoteMetadata,
+    pub name: String,
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -377,8 +377,8 @@ pub enum RemoteMetadata {
 }
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct RemoteFileMetadata {
-    mode: usize,
-    size: usize,
+    pub mode: usize,
+    pub size: usize,
 }
 
 impl Device {
