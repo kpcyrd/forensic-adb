@@ -1012,7 +1012,7 @@ impl Device {
 
             let tail = path
                 .strip_prefix(source)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
 
             let dest = append_components(dest_dir, tail)?;
             self.push(&mut file, &dest, mode).await?;
@@ -1042,18 +1042,12 @@ pub(crate) fn append_components(
 
     for component in tail.components() {
         if let Component::Normal(segment) = component {
-            let utf8 = segment.to_str().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    "Could not represent path segment as UTF-8",
-                )
-            })?;
+            let utf8 = segment
+                .to_str()
+                .ok_or_else(|| io::Error::other("Could not represent path segment as UTF-8"))?;
             buf.push(utf8);
         } else {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Unexpected path component".to_owned(),
-            ));
+            return Err(io::Error::other("Unexpected path component".to_owned()));
         }
     }
 
